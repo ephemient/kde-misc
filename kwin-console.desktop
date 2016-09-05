@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Interactive KWin console
+TryExec=busctl
+Exec=busctl call --user org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell showInteractiveKWinConsole
+Icon=kwin
+
+[Desktop Action LoadScript]
+Name=Load KWin script in interactive console
+TryExec=busctl
+Exec=busctl call --user org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell loadKWinScriptInInteractiveConsole s %F
+MimeType=application/javascript
+

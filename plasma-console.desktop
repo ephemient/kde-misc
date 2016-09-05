@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Interactive Plasma console
+TryExec=busctl
+Exec=busctl call --user org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell showInteractiveConsole
+Icon=plasma
+
+[Desktop Action LoadScript]
+Name=Load Plasma script in interactive console
+TryExec=busctl
+Exec=busctl call --user org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell loadScriptInInteractiveConsole s %F
+MimeType=application/javascript
+
