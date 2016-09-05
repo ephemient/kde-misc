@@ -1,0 +1,19 @@
+[Desktop Entry]
+Name=Fullscreen inhibit
+Comment=Inhibit the screensaver while a fullscreen window exists
+Icon=preferences-system-windows-script-test
+
+Type=Service
+
+X-Plasma-API=javascript
+X-Plasma-MainScript=code/main.js
+
+X-KDE-PluginInfo-Author=Daniel Lin
+X-KDE-PluginInfo-Email=ephemient@gmail.com
+X-KDE-PluginInfo-Name=fullscreen-inhibit
+X-KDE-PluginInfo-Version=0
+
+X-KDE-PluginInfo-Depends=
+X-KDE-PluginInfo-License=
+X-KDE-ServiceTypes=KWin/Script
+X-KDE-PluginKeyword=videowall
