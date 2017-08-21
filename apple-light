@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+
+import argparse
+import collections
+import collections.abc as abc
+import enum
+from gi.repository import GLib, Gio
+import itertools
+import logging
+import math
+import re
+from typing import Any, Callable, Iterable, Iterator, Optional, Union
+from typing.io import TextIO
+
+VERSION = '%(prog)s 0.01'
+LIGHT = '/sys/devices/platform/applesmc.768/light'
+
+
+def positive_int(string: str) -> int:
+    try:
+        value = int(string)
+        if value > 0:
+            return value
+    except (TypeError, ValueError) as e:
+        pass
+    raise argparse.ArgumentTypeError(f'{string!r} is not a positive integer')
+
+
+class nat(object):
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f'nat({self.value})'
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+    def of(self, high: int, steps: int) -> int:
+        return self.value * high // steps
+
+
+class percent(object):
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f'percent({self.value})'
+
+    def __str__(self) -> str:
+        return f'{self.value}%'
+
+    def of(self, high: int, steps: int) -> int:
+        return self.value * high // 100
+
+
+def nat_or_percent(string: str) -> Union[nat, percent]:
+    try:
+        if string.endswith('%'):
+            value = int(string[:-1])
+            if 0 <= value <= 100:
+                return percent(value)
+        else:
+            value = int(string)
+            if value >= 0:
+                return nat(value)
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError(
+        f'{string!r} is not a natural number or percentage')
+
+
+class Power(str, enum.Enum):
+    AC = ''
+    BATTERY = 'battery'
+    LOW_BATTERY = 'low battery'
+
+
+class Mode(abc.Iterable):
+    @staticmethod
+    def all() -> Iterable['Mode']:
+        for idle in (False, True):
+            for closed in (False, True):
+                for power in Power:
+                    yield Mode(idle=idle, closed=closed, power=power)
+
+    def __init__(self, *, idle=False, closed=False, power=Power.AC) -> None:
+        self.idle, self.closed, self.power = idle, closed, power
+
+    def __bool__(self) -> bool:
+        return bool(self.idle or self.closed or self.power)
+
+    def __iter__(self) -> Iterator['Mode']:
+        return iter(
+            filter(bool, (self.idle and 'idle', self.closed and 'closed',
+                          self.power)))
+
+    def __str__(self) -> str:
+        return '-'.join(self).replace(' ', '-') if self else 'default'
+
+    def __repr__(self) -> str:
+        return ('Mode('
+                f'idle={self.idle}, '
+                f'closed={self.closed}, '
+                f'power={self.power})')
+
+    def __eq__(self, other: 'Mode') -> bool:
+        if not isinstance(other, self.__class__): return False
+        return (self.idle, self.closed,
+                self.power) == (other.idle, other.closed, other.power)
+
+    def __hash__(self) -> int:
+        return hash((self.idle, self.closed, self.power))
+
+    def copy(self,
+             idle: Optional[bool]=None,
+             closed: Optional[bool]=None,
+             power: Optional[Power]=None) -> 'Mode':
+        return Mode(
+            idle=self.idle if idle is None else idle,
+            closed=self.closed if closed is None else closed,
+            power=self.power if power is None else power)
+
+    def parents(self) -> Iterable['Mode']:
+        for power in Power:
+            if power <= self.power:
+                for closed in (True, False) if self.closed else (False, ):
+                    for idle in (True, False) if self.idle else (False, ):
+                        yield Mode(idle=idle, closed=closed, power=power)
+
+
+class StoreTargetAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        setattr(namespace.target, self.dest, values)
+
+
+class Bus(object):
+    def __init__(self, **kwargs) -> None:
+        self.__dict__['vars'] = dict(**kwargs)
+        self.__dict__['subscriptions'] = collections.defaultdict(list)
+        self.__dict__['logger'] = logging.getLogger(self.__class__.__name__)
+
+    def subscribe(self, attr: str,
+                  callback: Callable[[str, Any], None]) -> None:
+        self.subscribe[attr].append(callback)
+        if attr in self.vars:
+            callback(self.vars[attr])
+
+    def __getattr__(self, name: str) -> Any:
+        vars = self.__dict__['vars']
+        if name in vars:
+            return vars[name]
+        raise AttributeError(
+            f'{self.__class__.__name__!r} object has no attribute {name!r}')
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        notify = name not in self.vars or self.vars[name] != value
+        if notify:
+            self.logger.info('%s: %r -> %r', name,
+                             self.vars.get(name, None), value)
+        self.vars[name] = value
+        if notify:
+            for callback in self.subscriptions.get(name, ()):
+                callback(name, value)
+
+
+class Component(object):
+    def __init__(self, bus: Bus) -> None:
+        self.bus = bus
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.debug('__init__()')
+
+
+class LightPoll(Component):
+    LIGHT_PATTERN = re.compile(r'\((?P<left>\d+),(?P<right>\d+)\)')
+
+    def __init__(self, bus: Bus, src: TextIO, poll_interval_ms: int) -> None:
+        super().__init__(bus)
+        self.src, self.poll_interval_ms = src, poll_interval_ms
+        self.last_value = None
+        self.idle = GLib.idle_source_new()
+        self.idle.set_callback(self.callback, GLib.SOURCE_REMOVE)
+        self.timer = GLib.timeout_source_new(self.poll_interval_ms)
+        self.timer.set_callback(self.callback, GLib.SOURCE_CONTINUE)
+
+    def callback(self, ret):
+        self.src.seek(0)
+        value = self.src.read()
+        self.logger.debug('read %r', value)
+        match = LightPoll.LIGHT_PATTERN.match(value.strip())
+        if match:
+            left, right = int(match.group('left')), int(match.group('right'))
+            self.bus.light = left + right
+        return ret
+
+    def attach(self, context: GLib.MainContext) -> None:
+        self.idle.attach(context)
+        self.timer.attach(context)
+
+
+class DBusPropertyWatcher(Component):
+    def __init__(self, bus: Bus, proxy: Gio.DBusProxy, prop: str) -> None:
+        super().__init__(bus)
+        self.proxy, self.prop = proxy, prop
+
+    def propertychange(self, value):
+        raise NotImplementedError()
+
+    def signal_callback(self,
+                        connection: Gio.DBusConnection,
+                        sender_name: str,
+                        object_path: str,
+                        interface_name: str,
+                        signal_name: str,
+                        parameters: GLib.Variant,
+                        data=None):
+        (interface_name, changed_properties,
+         invalidated_properties) = parameters.unpack()
+        if interface_name != self.proxy.get_interface_name():
+            return
+        if self.prop in changed_properties:
+            self.logger.debug('%s -> %r', self.prop,
+                              changed_properties[self.prop])
+            self.propertychange(changed_properties[self.prop])
+        elif self.prop in invalidated_properties:
+            self.logger.debug('%s -> ?', self.prop)
+            self.proxy.call('org.freedesktop.DBus.Properties.Get',
+                            GLib.Variant('(ss)',
+                                         (self.proxy.get_interface_name(),
+                                          self.prop)), Gio.DBusCallFlags.NONE,
+                            -1, None, self.method_callback, None)
+
+    def method_callback(self,
+                        proxy: Gio.DBusProxy,
+                        result: Gio.AsyncResult,
+                        data=None) -> None:
+        (value, ) = proxy.call_finish(result)
+        self.logger.debug('%s <- %r', self.prop, value)
+        self.propertychange(value)
+
+    def attach(self, context: GLib.MainContext) -> None:
+        self.proxy.get_connection().signal_subscribe(
+            self.proxy.get_name(), 'org.freedesktop.DBus.Properties',
+            'PropertiesChanged',
+            self.proxy.get_object_path(), None, Gio.DBusSignalFlags.NONE,
+            self.signal_callback, None)
+        self.proxy.call('org.freedesktop.DBus.Properties.Get',
+                        GLib.Variant('(ss)',
+                                     (self.proxy.get_interface_name(),
+                                      self.prop)), Gio.DBusCallFlags.NONE, -1,
+                        None, self.method_callback, None)
+
+
+class IdleWatcher(DBusPropertyWatcher):
+    def __init__(self, bus: Bus, login1: Gio.DBusProxy) -> None:
+        super().__init__(bus, login1, 'IdleHint')
+
+    def propertychange(self, idle: bool) -> None:
+        self.bus.mode = self.bus.mode.copy(idle=idle)
+
+
+class LidWatcher(DBusPropertyWatcher):
+    def __init__(self, bus: Bus, upower: Gio.DBusProxy) -> None:
+        super().__init__(bus, upower, 'LidIsClosed')
+
+    def propertychange(self, closed: bool) -> None:
+        self.bus.mode = self.bus.mode.copy(closed=closed)
+
+
+class BatteryWatcher(Component):
+    INTERFACE = 'org.freedesktop.UPower.Device'
+    PROPERTIES = ('energy', 'percentage', 'state')
+
+    def __init__(self, bus: Bus, upower: Gio.DBusProxy) -> None:
+        super().__init__(bus)
+        self.upower = upower
+        self.energy, self.percentage, self.state = math.inf, 100.0, 4
+
+    def power(self):
+        if self.state in (1, 4, 5):
+            return Power.AC
+        elif self.percentage <= 15:
+            return Power.LOW_BATTERY
+        else:
+            return Power.BATTERY
+
+    def signal_callback(self,
+                        connection: Gio.DBusConnection,
+                        sender_name: str,
+                        object_path: str,
+                        interface_name: str,
+                        signal_name: str,
+                        parameters: GLib.Variant,
+                        data=None):
+        (interface_name, changed_properties,
+         invalidated_properties) = parameters.unpack()
+        if interface_name != BatteryWatcher.INTERFACE:
+            return
+        changed = False
+        for prop in BatteryWatcher.PROPERTIES:
+            if prop.title() in changed_properties:
+                changed = True
+                setattr(self, prop, changed_properties[prop.title()])
+        if changed:
+            self.logger.debug('changed %r', changed_properties)
+            self.bus.mode = self.bus.mode.copy(power=self.power())
+        if set(prop.title() for prop in BatteryWatcher.PROPERTIES) & set(
+                invalidated_properties):
+            self.logger.debug('invalidated %r', invalidated_properties)
+            connection.call(sender_name, object_path,
+                            'org.freedesktop.DBus.Properties', 'GetAll',
+                            GLib.Variant('(s)', (BatteryWatcher.INTERFACE, )),
+                            GLib.VariantType('(a{sv})'),
+                            Gio.DBusCallFlags.NONE, -1, None,
+                            self.method_callback, None)
+
+    def method_callback(self,
+                        proxy: Gio.DBusProxy,
+                        result: Gio.AsyncResult,
+                        data=None) -> None:
+        (properties, ) = proxy.call_finish(result)
+        self.logger.debug('all = %r', properties)
+        for prop in BatteryWatcher.PROPERTIES:
+            if prop.title() in properties:
+                setattr(self, prop, properties[prop.title()])
+        self.bus.mode = self.bus.mode.copy(power=self.power())
+
+    def method0_callback(self,
+                         proxy: Gio.DBusProxy,
+                         result: Gio.AsyncResult,
+                         data=None) -> None:
+        (display_device, ) = proxy.call_finish(result)
+        self.logger.debug('display_device = %r', display_device)
+        self.upower.get_connection().signal_subscribe(
+            self.upower.get_name(), 'org.freedesktop.DBus.Properties',
+            'PropertiesChanged', display_device, None,
+            Gio.DBusSignalFlags.NONE, self.signal_callback, None)
+        self.upower.get_connection().call(
+            self.upower.get_name(), display_device,
+            'org.freedesktop.DBus.Properties', 'GetAll',
+            GLib.Variant('(s)', (BatteryWatcher.INTERFACE, )),
+            GLib.VariantType('(a{sv})'), Gio.DBusCallFlags.NONE, -1, None,
+            self.method_callback, None)
+
+    def attach(self, context: GLib.MainContext) -> None:
+        self.upower.call('GetDisplayDevice',
+                         GLib.Variant('()', ()), Gio.DBusCallFlags.NONE, -1,
+                         None, self.method0_callback, None)
+
+
+class BatteryPoller(Component):
+    def __init__(self, bus: Bus, upower: Gio.DBusProxy,
+                 poll_interval_ms: int) -> None:
+        super().__init__(bus)
+        self.upower, self.poll_interval_ms = upower, poll_interval_ms
+        self.power_supplies, self.subscriptions, self.pending = [], {}, {}
+        self.timer = GLib.timeout_source_new(self.poll_interval_ms)
+        self.timer.set_callback(self.timer_callback, GLib.SOURCE_CONTINUE)
+
+    def timer_callback(self, ret):
+        self.logger.debug('refreshing %r', self.power_supplies)
+        for power_supply in self.power_supplies:
+            self.upower.get_connection().call(
+                self.upower.get_name(), power_supply, BatteryWatcher.INTERFACE,
+                'Refresh',
+                GLib.Variant('()', ()),
+                GLib.VariantType('()'), Gio.DBusCallFlags.NONE, -1, None, None,
+                None)
+        return ret
+
+    def device_properties(self, device: str, power_supply: bool) -> None:
+        if power_supply and device not in self.power_supplies:
+            self.power_supplies.append(device)
+        elif not power_supply and device in self.power_supplies:
+            self.power_supplies.remove(device)
+
+    def signal_callback(self,
+                        connection: Gio.DBusConnection,
+                        sender_name: str,
+                        object_path: str,
+                        interface_name: str,
+                        signal_name: str,
+                        parameters: GLib.Variant,
+                        device: str):
+        (interface_name, changed_properties,
+         invalidated_properties) = parameters.unpack()
+        if 'PowerSupply' in changed_properties:
+            self.logger.debug('%r -> %r', device,
+                              changed_properties['PowerSupply'])
+            self.device_properties(device, changed_properties['PowerSupply'])
+        elif 'PowerSupply' in invalidated_properties:
+            self.logger.debug('%r -> ?', device)
+            if device not in self.pending:
+                cancel = Gio.Cancellable()
+                self.upower.get_connection().call(
+                    self.upower.get_name(), device,
+                    'org.freedesktop.DBus.Properties', 'Get',
+                    GLib.Variant('(ss)', (BatteryWatcher.INTERFACE,
+                                          'PowerSupply')),
+                    GLib.VariantType('(v)'), Gio.DBusCallFlags.NONE, -1, cancel,
+                    self.method_callback, device)
+                self.pending[device] = cancel
+
+    def method_callback(self,
+                        proxy: Gio.DBusProxy,
+                        result: Gio.AsyncResult,
+                        device: str) -> None:
+        (power_supply, ) = proxy.call_finish(result)
+        self.logger.debug('%r <- %r', device, power_supply)
+        self.device_properties(device, power_supply)
+
+    def add_device(self, device: str) -> None:
+        if device not in self.pending:
+            cancel = Gio.Cancellable()
+            self.upower.get_connection().call(
+                self.upower.get_name(), device,
+                'org.freedesktop.DBus.Properties', 'Get',
+                GLib.Variant('(ss)', (BatteryWatcher.INTERFACE,
+                                      'PowerSupply')),
+                GLib.VariantType('(v)'), Gio.DBusCallFlags.NONE, -1, cancel,
+                self.method_callback, device)
+            self.pending[device] = cancel
+        if device not in self.subscriptions:
+            self.subscriptions[
+                device] = self.upower.get_connection().signal_subscribe(
+                    self.upower.get_name(), 'org.freedesktop.DBus.Properties',
+                    'PropertiesChanged', device, None,
+                    Gio.DBusSignalFlags.NONE, self.signal_callback, None)
+
+    def remove_device(self, device: str) -> None:
+        self.power_supplies.remove(device)
+        if device in self.subscriptions:
+            self.upower.get_connection.signal_unsubscribe(
+                self.subscriptions[device])
+            del self.subscriptions[device]
+        if device in self.pending:
+            self.pending[device].cancel()
+            del self.pending[device]
+
+    def signal0_callback(self,
+                         connection: Gio.DBusConnection,
+                         sender_name: str,
+                         object_path: str,
+                         interface_name: str,
+                         signal_name: str,
+                         parameters: GLib.Variant,
+                         data=None):
+        (device, ) = parameters.unpack()
+        self.logger.info('%r(%r)', signal_name, device)
+        if signal_name == 'DeviceAdded':
+            self.add_device(device)
+        elif signal_name == 'DeviceRemoved':
+            self.remove_device(device)
+
+    def method0_callback(self,
+                         proxy: Gio.DBusProxy,
+                         result: Gio.AsyncResult,
+                         data=None) -> None:
+        (devices, ) = proxy.call_finish(result)
+        self.logger.info('devices = %r', devices)
+        for device in devices:
+            self.add_device(device)
+
+    def attach(self, context: GLib.MainContext) -> None:
+        self.timer.attach(context)
+        self.upower.get_connection().signal_subscribe(
+            self.upower.get_name(),
+            self.upower.get_interface_name(), 'DeviceAdded',
+            self.upower.get_object_path(), None, Gio.DBusSignalFlags.NONE,
+            self.signal0_callback, None)
+        self.upower.get_connection().signal_subscribe(
+            self.upower.get_name(),
+            self.upower.get_interface_name(), 'DeviceRemoved',
+            self.upower.get_object_path(), None, Gio.DBusSignalFlags.NONE,
+            self.signal0_callback, None)
+        self.upower.call('EnumerateDevices',
+                         GLib.Variant('()', ()), Gio.DBusCallFlags.NONE, -1,
+                         None, self.method0_callback, None)
+
+
+class BacklightController(Component):
+    def __init__(self,
+                 bus: Bus,
+                 dry_run: bool,
+                 graphical: bool,
+                 backlight: Gio.DBusProxy) -> None:
+        super().__init__(bus)
+        self.dry_run, self.graphical, self.backlight = (dry_run, graphical,
+                                                        backlight)
+
+    # TODO
+    def attach(self, context: GLib.MainContext) -> None:
+        pass
+
+
+class KeyboardController(Component):
+    def __init__(self,
+                 bus: Bus,
+                 dry_run: bool,
+                 graphical: bool,
+                 keyboard: Gio.DBusProxy) -> None:
+        super().__init__(bus)
+        self.dry_run, self.graphical, self.keyboard = (dry_run, graphical,
+                                                       keyboard)
+
+    # TODO
+    def attach(self, context: GLib.MainContext) -> None:
+        pass
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        fromfile_prefix_chars='@',
+        description='trigger actions from applesmc light changes')
+    parser.add_argument(
+        '-V',
+        '--version',
+        action='version',
+        version=VERSION,
+        help='output version and exit')
+    parser.add_argument(
+        '-n',
+        '--dry-run',
+        action='store_true',
+        help='don’t actually do anything, just show what would be done')
+    mutex = parser.add_mutually_exclusive_group()
+    mutex.add_argument(
+        '-q',
+        '--quiet',
+        dest='verbose',
+        action='store_const',
+        const=-1,
+        help='suppress diagnostic messages')
+    mutex.add_argument(
+        '-v',
+        '--verbose',
+        action='count',
+        help='explain what is being done (repeat for greater verbosity)')
+    mutex.add_argument(
+        '-d',
+        '--debug',
+        dest='verbose',
+        action='store_const',
+        const=3,
+        help='spew debug logs')
+    mutex = parser.add_mutually_exclusive_group()
+    mutex.add_argument(
+        '-G',
+        '--graphical',
+        action='store_true',
+        default=False,
+        help='graphical popup on brightness change')
+    mutex.add_argument(
+        '-g',
+        '--no-graphical',
+        action='store_false',
+        dest='graphical',
+        help='no graphical popup on brightness change (default)')
+    group = parser.add_argument_group('sources')
+    group.add_argument(
+        '--light',
+        type=argparse.FileType('r'),
+        default=LIGHT,
+        help='light source')
+    group.add_argument(
+        '--light-poll',
+        metavar='MS',
+        type=positive_int,
+        default=1000,
+        help='light polling interval (milliseconds)')
+    mutex = group.add_mutually_exclusive_group()
+    mutex.add_argument(
+        '--idle',
+        action='store_true',
+        default=True,
+        help='enable logind seat idle source (default)')
+    mutex.add_argument(
+        '--no-idle',
+        action='store_false',
+        dest='idle',
+        help='disable logind seat idle source')
+    mutex = group.add_mutually_exclusive_group()
+    mutex.add_argument(
+        '--lid',
+        action='store_true',
+        default=True,
+        help='enable lid switch (default)')
+    mutex.add_argument(
+        '--no-lid',
+        action='store_false',
+        dest='lid',
+        help='disable lid switch')
+    mutex = group.add_mutually_exclusive_group()
+    mutex.add_argument(
+        '--battery',
+        action='store_true',
+        default=True,
+        help='enable battery monitor (default)')
+    mutex.add_argument(
+        '--no-battery',
+        action='store_false',
+        dest='battery',
+        help='disable battery monitor')
+    mutex.add_argument(
+        '--battery-poll',
+        metavar='MS',
+        type=int,
+        default=5000,
+        help='refresh battery status periodically')
+    group = parser.add_argument_group('backlight')
+    mutex = group.add_mutually_exclusive_group()
+    mutex.add_argument(
+        '-b',
+        '--backlight',
+        action='store_true',
+        default=True,
+        help='control the backlight (default)')
+    mutex.add_argument(
+        '-B',
+        '--no-backlight',
+        action='store_false',
+        dest='backlight',
+        help='do not control the backlight')
+    group.add_argument(
+        '-m',
+        '--minimum-brightness',
+        metavar='<N|N%>',
+        type=nat_or_percent,
+        action=StoreTargetAction,
+        default=argparse.SUPPRESS,
+        help='minimum backlight brightness')
+    group.add_argument(
+        '-M',
+        '--maximum-brightness',
+        metavar='<N|N%>',
+        type=nat_or_percent,
+        action=StoreTargetAction,
+        default=argparse.SUPPRESS,
+        help='maximum backlight brightness')
+    group.add_argument(
+        '--brightness-start',
+        metavar='<N|N%>',
+        type=nat_or_percent,
+        action=StoreTargetAction,
+        default=argparse.SUPPRESS,
+        help='mapping of light to minimum backlight brightness')
+    group.add_argument(
+        '--brightness-end',
+        metavar='<N|N%>',
+        type=nat_or_percent,
+        action=StoreTargetAction,
+        default=argparse.SUPPRESS,
+        help='mapping of light to maximum backlight brightness')
+    group = parser.add_argument_group('keyboard')
+    mutex = group.add_mutually_exclusive_group()
+    mutex.add_argument(
+        '-k',
+        '--keyboard',
+        action='store_true',
+        default=True,
+        help='control the keyboard brightness (default)')
+    mutex.add_argument(
+        '-K',
+        '--no-keyboard',
+        action='store_false',
+        dest='keyboard',
+        help='do not control the keyboard brightness')
+    group.add_argument(
+        '--minimum-keyboard-brightness',
+        metavar='<N|N%>',
+        type=nat_or_percent,
+        action=StoreTargetAction,
+        default=argparse.SUPPRESS,
+        help='minimum keyboard brightness')
+    group.add_argument(
+        '--maximum-keyboard-brightness',
+        metavar='<N|N%>',
+        type=nat_or_percent,
+        action=StoreTargetAction,
+        default=argparse.SUPPRESS,
+        help='maximum keyboard brightness')
+    group.add_argument(
+        '--keyboard-brightness-start',
+        metavar='<N|N%>',
+        type=nat_or_percent,
+        action=StoreTargetAction,
+        default=argparse.SUPPRESS,
+        help='mapping of light to minimum keyboard brightness')
+    group.add_argument(
+        '--keyboard-brightness-end',
+        metavar='<N|N%>',
+        type=nat_or_percent,
+        action=StoreTargetAction,
+        default=argparse.SUPPRESS,
+        help='mapping of light to maximum keyboard brightness')
+    group = parser.add_argument_group('modes')
+    modes = {
+        mode: argparse.Namespace() if mode else argparse.Namespace(
+            minimum_brightness=nat(1),
+            maximum_brightness=percent(100),
+            brightness_start=nat(0),
+            brightness_end=nat(255),
+            minimum_keyboard_brightness=nat(1),
+            maximum_keyboard_brightness=percent(100),
+            keyboard_brightness_start=nat(30),
+            keyboard_brightness_end=nat(0))
+        for mode in Mode.all()
+    }
+    for mode, target in modes.items():
+        group.add_argument(
+            f'--when-{mode}' if mode else '--default',
+            dest='target',
+            action='store_const',
+            const=target,
+            help=f"apply when {' and'.join(', '.join(mode).rsplit(',', 1))}"
+            if mode else 'apply by default')
+    args = parser.parse_args()
+    del args.target
+    modes = {
+        mode: argparse.Namespace(**{
+            key: next(
+                filter(bool, (getattr(modes[m], key, None)
+                              for m in mode.parents())), None)
+            for key in set(itertools.chain(*map(vars, modes.values())))
+        })
+        for mode in Mode.all()
+    }
+
+    level = args.verbose or 0
+    if args.dry_run and level < 2: level = 2
+    logging.basicConfig(
+        format='%(levelname).1s%(asctime)s.%(msecs)03d'
+        ' %(name)s %(module)s:%(lineno)d] %(message)s',
+        datefmt='%m%d %H:%M:%S',
+        level=40 - 10 * level)
+    logger = logging.getLogger(__name__)
+    logger.info('args = %s', args)
+    if logger.isEnabledFor(logging.DEBUG):
+        for mode in Mode.all():
+            logging.debug('modes[%s] = %r', mode, modes[mode])
+
+    bus = Bus(mode=Mode())
+    light_poller = LightPoll(bus, args.light, args.light_poll)
+
+    if args.idle:
+        login1 = Gio.DBusProxy.new_sync(
+            Gio.bus_get_sync(Gio.BusType.SYSTEM,
+                             None), Gio.DBusProxyFlags.NONE, None,
+            'org.freedesktop.login1', '/org/freedesktop/login1/session/self',
+            'org.freedesktop.login1.Session', None)
+        idle_watcher = IdleWatcher(bus, login1)
+    else:
+        idle_watcher = None
+
+    if args.lid or args.battery:
+        upower = Gio.DBusProxy.new_sync(
+            Gio.bus_get_sync(Gio.BusType.SYSTEM, None),
+            Gio.DBusProxyFlags.NONE, None, 'org.freedesktop.UPower',
+            '/org/freedesktop/UPower', 'org.freedesktop.UPower', None)
+    if args.lid:
+        lid_watcher = LidWatcher(bus, upower)
+    else:
+        lid_watcher = None
+    if args.battery:
+        battery_watcher = BatteryWatcher(bus, upower)
+    else:
+        battery_watcher = None
+    if args.battery and args.battery_poll > 0:
+        battery_poller = BatteryPoller(bus, upower, args.battery_poll)
+    else:
+        battery_poller = None
+
+    if args.backlight:
+        backlight = Gio.DBusProxy.new_sync(
+            Gio.bus_get_sync(Gio.BusType.SESSION, None),
+            Gio.DBusProxyFlags.NONE, None, 'org.kde.Solid.PowerManagement',
+            '/org/kde/Solid/PowerManagement/Actions/BrightnessControl',
+            'org.kde.Solid.PowerManagement.Actions.BrightnessControl', None)
+        backlight_controller = BacklightController(bus, args.dry_run,
+                                                   args.graphical, backlight)
+    else:
+        backlight_controller = None
+
+    if args.keyboard:
+        keyboard = Gio.DBusProxy.new_sync(
+            Gio.bus_get_sync(Gio.BusType.SESSION, None),
+            Gio.DBusProxyFlags.NONE, None, 'org.kde.Solid.PowerManagement',
+            '/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl',
+            'org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl',
+            None)
+        keyboard_controller = KeyboardController(bus, args.dry_run,
+                                                 args.graphical, keyboard)
+    else:
+        keyboard_controller = None
+
+    main_loop = GLib.MainLoop()
+    main_context = main_loop.get_context()
+    if light_poller is not None:
+        light_poller.attach(main_context)
+    if idle_watcher is not None:
+        idle_watcher.attach(main_context)
+    if lid_watcher is not None:
+        lid_watcher.attach(main_context)
+    if battery_watcher is not None:
+        battery_watcher.attach(main_context)
+    if battery_poller is not None:
+        battery_poller.attach(main_context)
+    if backlight_controller is not None:
+        backlight_controller.attach(main_context)
+    if keyboard_controller is not None:
+        keyboard_controller.attach(main_context)
+    main_loop.run()
+
+
+if __name__ == '__main__':
+    main()
