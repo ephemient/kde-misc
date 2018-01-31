@@ -1,0 +1,36 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+    echo 'Usage: $0 [-B] [-b] [-w <window-id>]'
+    echo '  -B    disable blur'
+    echo '  -b    enable blur'
+    echo '  -w    X11 window ID'
+}
+
+wid() {
+    if [[ -n ${WID:-} ]]; then
+        printf '%s\n' "${WID}"
+    elif [[ -n ${KONSOLE_DBUS_SERVICE:-} ]] &&
+        N=$(expr match "${KONSOLE_DBUS_WINDOW:-}" '.*/\([[:digit:]]\+\)$'); then
+        qdbus "${KONSOLE_DBUS_SERVICE}" "/konsole/MainWindow_${N}" org.kde.KMainWindow.winId
+    else
+        return 1
+    fi
+}
+
+while getopts ':Bbw:' OPT; do
+    shift $((OPTIND-1))
+    case ${OPT} in
+        B) BLUR=0 ;;
+        b) BLUR=1 ;;
+        w) WID=${OPTARG} ;;
+        *) usage; exit ;;
+    esac
+done
+
+if [[ -z ${BLUR:-} || ${BLUR} != 0 ]]; then
+    xprop -f _KDE_NET_WM_BLUR_BEHIND_REGION 32c -set _KDE_NET_WM_BLUR_BEHIND_REGION 0 -id "$(wid)"
+elif [[ ${BLUR} = 0 ]]; then
+    xprop -remove _KDE_NET_WM_BLUR_BEHIND_REGION -id "$(wid)"
+fi
